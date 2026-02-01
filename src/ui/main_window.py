@@ -39,21 +39,21 @@ class TranslationWorker(QThread):
         try:
             # Initialize modules
             self.status_updated.emit("Initializing Speech Recognizer...")
-            rec_config = self.cm.get("recognition", {})
+            rec_config = self.cm.get("recognition")
             self.recognizer = SpeechRecognizer(
                 model_size=rec_config.get("model_size", "base"),
                 device=rec_config.get("device", "cpu")
             )
             
             self.status_updated.emit("Initializing Translator...")
-            trans_config = self.cm.get("translation", {})
+            trans_config = self.cm.get("translation")
             self.translator = Translator(
                 source=trans_config.get("source_lang", "auto"),
                 target=trans_config.get("target_lang", "zh-CN")
             )
             
             # Configure Audio
-            audio_config = self.cm.get("audio", {})
+            audio_config = self.cm.get("audio")
             self.audio_capture.device_index = audio_config.get("device_index")
             self.audio_capture.start()
             
@@ -105,7 +105,10 @@ class TranslationWorker(QThread):
                     self.status_updated.emit("Listening...")
                     
         except Exception as e:
-            self.error_occurred.emit(str(e))
+            import traceback
+            error_msg = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            print(f"Worker error: {error_msg}")
+            self.error_occurred.emit(error_msg)
         finally:
             self.audio_capture.stop()
             self.status_updated.emit("Stopped.")
@@ -121,7 +124,7 @@ class MainWindow(QMainWindow):
         self.resize(400, 600)
         
         self.cm = ConfigManager()
-        self.subtitle_window = SubtitleWindow(self.cm.get("display", {}))
+        self.subtitle_window = SubtitleWindow(self.cm.config.get("display", {}))
         self.worker = None
         
         self.init_ui()
@@ -167,11 +170,11 @@ class MainWindow(QMainWindow):
         
         self.combo_src = QComboBox()
         self.combo_src.addItems(["auto", "en", "zh", "ja", "ko"])
-        self.combo_src.setCurrentText(self.cm.get("translation", {}).get("source_lang", "auto"))
+        self.combo_src.setCurrentText(self.cm.get("translation").get("source_lang", "auto"))
         
         self.combo_target = QComboBox()
         self.combo_target.addItems(["zh-CN", "en", "ja", "ko"])
-        self.combo_target.setCurrentText(self.cm.get("translation", {}).get("target_lang", "zh-CN"))
+        self.combo_target.setCurrentText(self.cm.get("translation").get("target_lang", "zh-CN"))
         
         # Connect save
         self.combo_src.currentTextChanged.connect(self.save_lang_settings)
@@ -190,12 +193,12 @@ class MainWindow(QMainWindow):
         
         self.slider_opacity = QSlider(Qt.Orientation.Horizontal)
         self.slider_opacity.setRange(10, 100)
-        self.slider_opacity.setValue(int(self.cm.get("display", {}).get("opacity", 0.7) * 100))
+        self.slider_opacity.setValue(int(self.cm.get("display").get("opacity", 0.7) * 100))
         self.slider_opacity.valueChanged.connect(self.update_appearance)
         
         self.spin_font_size = QSpinBox()
         self.spin_font_size.setRange(12, 72)
-        self.spin_font_size.setValue(self.cm.get("display", {}).get("font_size", 24))
+        self.spin_font_size.setValue(self.cm.get("display").get("font_size", 24))
         self.spin_font_size.valueChanged.connect(self.update_appearance)
         
         ui_layout.addWidget(QLabel("Opacity:"))
@@ -216,7 +219,7 @@ class MainWindow(QMainWindow):
         capture = AudioCapture()
         devices = capture.list_devices()
         
-        default_index = self.cm.get("audio", {}).get("device_index")
+        default_index = self.cm.get("audio").get("device_index")
         current_index = 0
         
         for i, dev in enumerate(devices):
@@ -240,7 +243,7 @@ class MainWindow(QMainWindow):
         opacity = self.slider_opacity.value() / 100.0
         font_size = self.spin_font_size.value()
         
-        display_config = self.cm.get("display", {})
+        display_config = self.cm.get("display")
         display_config["opacity"] = opacity
         display_config["font_size"] = font_size
         self.cm.set("display", "opacity", opacity)

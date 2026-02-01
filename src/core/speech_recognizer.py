@@ -1,6 +1,13 @@
-from faster_whisper import WhisperModel
 import os
+import sys
 import time
+
+# Set OpenMP environment variables BEFORE importing ctranslate2/faster_whisper
+# This helps avoid DLL conflicts in packaged applications
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["OMP_NUM_THREADS"] = "1"  # Single thread to avoid OpenMP DLL conflicts
+
+from faster_whisper import WhisperModel
 
 class SpeechRecognizer:
     def __init__(self, model_size="base", device="cpu", compute_type="int8"):
@@ -8,16 +15,33 @@ class SpeechRecognizer:
         self.device = device
         self.compute_type = compute_type
         self.model = None
-        # Lazy loading or explicit loading can be done. 
-        # We'll load immediately to fail fast if model download fails, 
-        # but in GUI it might freeze. Better to load on first use or in background.
-        # For simplicity, we assume the user accepts a startup delay.
+
         print(f"Loading Whisper model: {model_size} on {device}...")
+        sys.stdout.flush()  # Ensure output is visible before potential crash
+
         try:
-            self.model = WhisperModel(model_size, device=device, compute_type=compute_type)
+            print(f"  compute_type: {compute_type}")
+            print(f"  Creating WhisperModel...")
+            sys.stdout.flush()
+
+            # Use int8 for CPU to avoid potential issues
+            if device == "cpu":
+                compute_type = "int8"
+
+            # Use single thread to avoid OpenMP DLL conflicts in packaged app
+            self.model = WhisperModel(
+                model_size,
+                device=device,
+                compute_type=compute_type,
+                cpu_threads=1
+            )
             print("Whisper model loaded successfully.")
+            sys.stdout.flush()
         except Exception as e:
+            import traceback
             print(f"Error loading Whisper model: {e}")
+            traceback.print_exc()
+            sys.stdout.flush()
             raise e
 
     def transcribe(self, audio_data, language=None):

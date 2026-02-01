@@ -14,13 +14,13 @@ def build():
     PyInstaller.__main__.run([
         'main.py',
         '--name=MeetingTranslator',
-        '--noconsole',
+        '--console',  # 临时启用控制台以便调试
         '--onedir',
         '--clean',
         '--collect-all=faster_whisper',
         '--collect-all=ctranslate2',
         '--collect-all=tokenizers',
-        '--collect-all=torch',  # Ensure full torch is collected
+        '--exclude-module=torch',
         '--paths=.', 
     ])
 
@@ -29,26 +29,18 @@ def build():
     dist_dir = os.path.join("dist", "MeetingTranslator")
     internal_dir = os.path.join(dist_dir, "_internal")
 
-    # Post-processing: avoid duplicate OpenMP runtimes.
-    # Both ctranslate2 and torch ship libiomp5md.dll. Loading two different copies
-    # (different paths) can cause WinError 1114 during torch DLL initialization.
-    # Keep ctranslate2's copy and remove torch's copies.
-    torch_lib_dir = os.path.join(internal_dir, "torch", "lib")
-    torch_iomp = os.path.join(torch_lib_dir, "libiomp5md.dll")
-    torch_iomp_stub = os.path.join(torch_lib_dir, "libiompstubs5md.dll")
-
-    for path in (torch_iomp, torch_iomp_stub):
-        if os.path.exists(path):
-            print(f"Removing duplicate OpenMP runtime: {path}")
-            os.remove(path)
-
-    # Ensure libiomp5md.dll exists in _internal root for torch/ctranslate2 to find
+    # Post-processing: fix OpenMP DLL conflict
+    # Only keep ONE copy of libiomp5md.dll in _internal root
     ct2_iomp = os.path.join(internal_dir, "ctranslate2", "libiomp5md.dll")
     root_iomp = os.path.join(internal_dir, "libiomp5md.dll")
-    
-    if os.path.exists(ct2_iomp) and not os.path.exists(root_iomp):
-        print(f"Copying OpenMP runtime to root: {ct2_iomp} -> {root_iomp}")
-        shutil.copy2(ct2_iomp, root_iomp)
+
+    if os.path.exists(ct2_iomp):
+        if not os.path.exists(root_iomp):
+            print(f"Copying OpenMP runtime to root: {ct2_iomp} -> {root_iomp}")
+            shutil.copy2(ct2_iomp, root_iomp)
+        # Remove the duplicate to avoid DLL conflicts
+        print(f"Removing duplicate OpenMP DLL: {ct2_iomp}")
+        os.remove(ct2_iomp)
 
     print("Build output in dist/MeetingTranslator")
 

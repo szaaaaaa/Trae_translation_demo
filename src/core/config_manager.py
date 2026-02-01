@@ -64,7 +64,10 @@ class ConfigManager:
         except Exception as e:
             print(f"Error saving config: {e}")
 
-    def get(self, section, key, default=None):
+    def get(self, section, key=None, default=None):
+        if key is None:
+            # Return entire section
+            return self.config.get(section, default if default is not None else {})
         return self.config.get(section, {}).get(key, default)
 
     def set(self, section, key, value):
