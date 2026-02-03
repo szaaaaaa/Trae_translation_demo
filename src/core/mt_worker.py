@@ -174,8 +174,11 @@ class MTWorker:
         try:
             import torch
 
-            # 设置源语言
-            self._tokenizer.src_lang = self.src_lang
+            # 设置源语言（兼容新旧版 transformers）
+            try:
+                self._tokenizer.src_lang = self.src_lang
+            except AttributeError:
+                pass  # 部分 tokenizer 后端不支持直接设置 src_lang
 
             # 编码输入
             inputs = self._tokenizer(
@@ -188,8 +191,11 @@ class MTWorker:
             if self.device == "cuda":
                 inputs = {k: v.cuda() for k, v in inputs.items()}
 
-            # 获取目标语言 ID
-            forced_bos_token_id = self._tokenizer.lang_code_to_id[self.tgt_lang]
+            # 获取目标语言 token ID（兼容新旧版 transformers）
+            if hasattr(self._tokenizer, 'lang_code_to_id'):
+                forced_bos_token_id = self._tokenizer.lang_code_to_id[self.tgt_lang]
+            else:
+                forced_bos_token_id = self._tokenizer.convert_tokens_to_ids(self.tgt_lang)
 
             # 生成翻译
             with torch.no_grad():
