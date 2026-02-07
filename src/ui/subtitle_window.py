@@ -33,6 +33,9 @@ class SubtitleWindow(QMainWindow):
         self._history_lines = self.config.get('history_lines', 50)
         self._src_history = deque(maxlen=self._history_lines)
         self._tgt_history = deque(maxlen=self._history_lines)
+        self._display_lines = int(self.config.get('display_lines', 8))
+        if self._display_lines < 3:
+            self._display_lines = 3
 
         # 当前 partial 文本
         self._partial_src = ""
@@ -172,10 +175,10 @@ class SubtitleWindow(QMainWindow):
         src_lines = list(self._src_history)
         if self._partial_src:
             src_lines.append(f"▸ {self._partial_src}")  # partial 用特殊符号标记
-        src_text = "\n".join(src_lines[-3:])  # 只显示最近 3 行
+        src_text = "\n".join(src_lines[-self._display_lines:])  # 显示最近 N 行
 
         # 译文：历史
-        tgt_text = "\n".join(list(self._tgt_history)[-3:])  # 只显示最近 3 行
+        tgt_text = "\n".join(list(self._tgt_history)[-self._display_lines:])  # 显示最近 N 行
 
         self.src_label.setText(src_text)
         self.tgt_label.setText(tgt_text)

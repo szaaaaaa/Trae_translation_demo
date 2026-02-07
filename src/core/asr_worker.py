@@ -28,7 +28,9 @@ class ASRWorker:
                  device: str = "cuda",
                  compute_type: str = "float16",
                  beam_size: int = 1,
-                 temperature: float = 0.0):
+                 temperature: float = 0.0,
+                 word_timestamps: bool = False,
+                 condition_on_previous_text: bool = False):
         """
         初始化 ASR Worker
 
@@ -48,6 +50,8 @@ class ASRWorker:
         self.compute_type = compute_type
         self.beam_size = beam_size
         self.temperature = temperature
+        self.word_timestamps = word_timestamps
+        self.condition_on_previous_text = condition_on_previous_text
 
         self._model = None
         self._running = False
@@ -139,7 +143,8 @@ class ASRWorker:
                 beam_size=self.beam_size,
                 temperature=self.temperature,
                 vad_filter=False,
-                word_timestamps=False
+                word_timestamps=self.word_timestamps,
+                condition_on_previous_text=self.condition_on_previous_text
             )
 
             # 合并所有 segment 的文本

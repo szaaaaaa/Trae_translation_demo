@@ -1,6 +1,6 @@
 {
     "audio": {
-        "device_index": 1,
+        "device_index": 27,
         "sample_rate": 16000
     },
     "translation": {
@@ -8,7 +8,7 @@
         "target_lang": "zh-CN"
     },
     "display": {
-        "opacity": 0.64,
+        "opacity": 0.39,
         "font_size": 12,
         "show_original": true
     },

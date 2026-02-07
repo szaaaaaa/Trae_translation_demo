@@ -20,7 +20,10 @@ class TextStabilizer:
     def __init__(self,
                  lock_min_chars: int = 12,
                  buffer_keep_chars: int = 80,
-                 lcp_min_chars: int = 8):
+                 lcp_min_chars: int = 8,
+                 enable_partial: bool = True,
+                 commit_only_new_text: bool = True,
+                 use_word_alignment: bool = False):
         """
         初始化稳定器
 
@@ -32,6 +35,9 @@ class TextStabilizer:
         self.lock_min_chars = lock_min_chars
         self.buffer_keep_chars = buffer_keep_chars
         self.lcp_min_chars = lcp_min_chars
+        self.enable_partial = enable_partial
+        self.commit_only_new_text = commit_only_new_text
+        self.use_word_alignment = use_word_alignment
 
         self._locked_text = ""
         self._buffer_text = ""
@@ -70,12 +76,16 @@ class TextStabilizer:
             self._buffer_text = self._buffer_text[-self.buffer_keep_chars:]
 
         partial_src = self._locked_text + self._buffer_text
+        if not self.enable_partial:
+            partial_src = ""
 
         # Final 处理
         final_append_src = None
         if asr_result.is_final:
-            # final 时，将所有文本作为最终输出
-            final_append_src = candidate[self._last_final_pos:] if len(candidate) > self._last_final_pos else candidate
+            if self.commit_only_new_text:
+                final_append_src = candidate[self._last_final_pos:] if len(candidate) > self._last_final_pos else ""
+            else:
+                final_append_src = candidate
 
             # 更新状态
             self._locked_text = ""

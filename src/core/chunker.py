@@ -23,7 +23,9 @@ class Chunker:
                  overlap_ms: int = 200,
                  max_utterance_ms: int = 10000,
                  tail_pad_ms: int = 120,
-                 sample_rate: int = 16000):
+                 sample_rate: int = 16000,
+                 window_ms: int = 0,
+                 step_ms: int = 0):
         """
         初始化分块器
 
@@ -39,26 +41,48 @@ class Chunker:
         self.max_utterance_samples = max_utterance_ms * sample_rate // 1000
         self.tail_pad_samples = tail_pad_ms * sample_rate // 1000
         self.sample_rate = sample_rate
+        self.window_samples = window_ms * sample_rate // 1000 if window_ms else 0
+        self.step_samples = step_ms * sample_rate // 1000 if step_ms else 0
 
         self._buffer: List[np.ndarray] = []
         self._buffer_samples = 0
+        self._utterance_buffer: List[np.ndarray] = []
+        self._utterance_samples = 0
         self._overlap_buffer = np.zeros(self.overlap_samples, dtype=np.float32)
         self._utterance_start_time = 0.0
         self._last_chunk_time = 0.0
         self._total_utterance_samples = 0
+        self._step_accum = 0
 
-    def on_vad_start(self, timestamp: float) -> None:
+    def on_vad_start(self, timestamp: float, pre_audio: Optional[np.ndarray] = None) -> None:
         """
         VAD 开始事件
 
         Args:
             timestamp: 开始时间戳
+            pre_audio: 预滚音频
         """
         self._buffer = []
         self._buffer_samples = 0
+        self._utterance_buffer = []
+        self._utterance_samples = 0
+        self._overlap_buffer = np.zeros(self.overlap_samples, dtype=np.float32)
         self._utterance_start_time = timestamp
         self._last_chunk_time = timestamp
         self._total_utterance_samples = 0
+        self._step_accum = 0
+        if pre_audio is not None and len(pre_audio) > 0:
+            pre_audio = pre_audio.astype(np.float32).flatten()
+            self._buffer.append(pre_audio)
+            self._utterance_buffer.append(pre_audio)
+            self._buffer_samples += len(pre_audio)
+            self._utterance_samples += len(pre_audio)
+            self._total_utterance_samples += len(pre_audio)
+            if self.overlap_samples > 0:
+                if len(pre_audio) >= self.overlap_samples:
+                    self._overlap_buffer = pre_audio[-self.overlap_samples:].copy()
+                else:
+                    self._overlap_buffer = pre_audio.copy()
         logger.debug(f"Chunker: utterance started at {timestamp:.2f}")
 
     def on_speech_frame(self, frame: np.ndarray,
@@ -76,11 +100,20 @@ class Chunker:
         frame = frame.astype(np.float32).flatten()
         self._buffer.append(frame)
         self._buffer_samples += len(frame)
+        self._utterance_buffer.append(frame)
+        self._utterance_samples += len(frame)
         self._total_utterance_samples += len(frame)
+        self._step_accum += len(frame)
 
-        # 检查是否需要输出 partial chunk
-        if self._buffer_samples >= self.chunk_samples:
-            return self._emit_chunk(timestamp, is_final=False)
+        # 滑窗模式：达到 step_samples 就输出最近 window_samples
+        if self.window_samples > 0 and self.step_samples > 0:
+            if self._step_accum >= self.step_samples:
+                self._step_accum = 0
+                return self._emit_chunk(timestamp, is_final=False, use_window=True)
+        else:
+            # 传统模式：按 chunk_ms 输出
+            if self._buffer_samples >= self.chunk_samples:
+                return self._emit_chunk(timestamp, is_final=False, use_window=False)
 
         # 检查是否超过最大 utterance 长度
         if self._total_utterance_samples >= self.max_utterance_samples:
@@ -105,7 +138,7 @@ class Chunker:
 
         return self._emit_chunk(timestamp, is_final=True)
 
-    def _emit_chunk(self, timestamp: float, is_final: bool) -> ASRChunk:
+    def _emit_chunk(self, timestamp: float, is_final: bool, use_window: bool = False) -> ASRChunk:
         """
         输出一个 chunk
 
@@ -117,14 +150,29 @@ class Chunker:
             ASRChunk
         """
         # 合并缓冲区
-        if self._buffer:
-            audio = np.concatenate(self._buffer, axis=0)
+        if is_final:
+            if self._utterance_buffer:
+                audio = np.concatenate(self._utterance_buffer, axis=0)
+            else:
+                audio = np.array([], dtype=np.float32)
         else:
-            audio = np.array([], dtype=np.float32)
+            if use_window and self.window_samples > 0:
+                # 取最近 window_samples 作为滑窗
+                if self._utterance_buffer:
+                    audio = np.concatenate(self._utterance_buffer, axis=0)
+                else:
+                    audio = np.array([], dtype=np.float32)
+                if len(audio) > self.window_samples:
+                    audio = audio[-self.window_samples:]
+            else:
+                if self._buffer:
+                    audio = np.concatenate(self._buffer, axis=0)
+                else:
+                    audio = np.array([], dtype=np.float32)
 
-        # 添加 overlap（头部历史音频）
-        if len(self._overlap_buffer) > 0 and len(audio) > 0:
-            audio = np.concatenate([self._overlap_buffer, audio])
+                # 添加 overlap（头部历史音频）
+                if len(self._overlap_buffer) > 0 and len(audio) > 0:
+                    audio = np.concatenate([self._overlap_buffer, audio])
 
         # final chunk 添加尾部静音
         if is_final and self.tail_pad_samples > 0:
@@ -150,6 +198,8 @@ class Chunker:
         if is_final:
             self._buffer = []
             self._buffer_samples = 0
+            self._utterance_buffer = []
+            self._utterance_samples = 0
             self._total_utterance_samples = 0
         else:
             # 保留 overlap 部分用于下一个 chunk
@@ -168,8 +218,11 @@ class Chunker:
         """重置状态"""
         self._buffer = []
         self._buffer_samples = 0
+        self._utterance_buffer = []
+        self._utterance_samples = 0
         self._overlap_buffer = np.zeros(self.overlap_samples, dtype=np.float32)
         self._utterance_start_time = 0.0
         self._last_chunk_time = 0.0
         self._total_utterance_samples = 0
+        self._step_accum = 0
         logger.debug("Chunker: reset")

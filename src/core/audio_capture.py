@@ -27,7 +27,10 @@ class AudioCapture:
                  mode: str = "loopback",
                  device_index: Optional[int] = None,
                  sample_rate: int = 16000,
-                 frame_ms: int = 20):
+                 frame_ms: int = 20,
+                 channels: int = 1,
+                 ring_buffer_seconds: int = 20,
+                 pre_roll_ms: int = 400):
         """
         初始化音频采集器
 
@@ -41,14 +44,20 @@ class AudioCapture:
         self.device_index = device_index
         self.sample_rate = sample_rate
         self.frame_ms = frame_ms
+        self.channels = channels
         self.frame_samples = self.VAD_FRAME_SAMPLES  # 512 for Silero VAD
+        self.pre_roll_ms = pre_roll_ms
 
         self._native_sr: int = sample_rate  # 设备原生采样率，start() 时更新
         self._stream: Optional[sd.InputStream] = None
         self._running = False
         self._restart_count = 0
         self._max_restarts = 5
-        self._frame_queue: queue.Queue = queue.Queue(maxsize=1000)
+        max_frames = max(100, int(ring_buffer_seconds * 1000 / self.frame_ms))
+        self._frame_queue: queue.Queue = queue.Queue(maxsize=max_frames)
+        self._pre_roll_frames: queue.deque = queue.deque(
+            maxlen=max(1, int(self.pre_roll_ms / self.frame_ms))
+        )
         self._resample_buf = np.array([], dtype=np.float32)  # 重采样后的累积缓冲区
 
     def list_devices(self) -> List[Dict]:
@@ -67,6 +76,27 @@ class AudioCapture:
                     'is_loopback': 'loopback' in dev['name'].lower() or 'stereo mix' in dev['name'].lower()
                 })
         return devices
+
+    def get_default_devices(self) -> Dict[str, Optional[int]]:
+        """获取系统默认输入/输出设备索引"""
+        try:
+            default_in, default_out = sd.default.device
+        except Exception:
+            return {'input': None, 'output': None}
+
+        def _normalize(idx):
+            if idx is None:
+                return None
+            try:
+                idx = int(idx)
+            except Exception:
+                return None
+            return idx if idx >= 0 else None
+
+        return {
+            'input': _normalize(default_in),
+            'output': _normalize(default_out)
+        }
 
     def _find_device(self) -> int:
         """根据模式自动选择设备"""
@@ -134,6 +164,7 @@ class AudioCapture:
                     self._frame_queue.put_nowait(frame)
                 except queue.Empty:
                     pass
+            self._pre_roll_frames.append(chunk.copy())
 
     def start(self) -> None:
         """启动音频采集"""
@@ -162,7 +193,7 @@ class AudioCapture:
             self._stream = sd.InputStream(
                 device=device_idx,
                 samplerate=native_sr,
-                channels=1,
+                channels=self.channels,
                 dtype=np.float32,
                 blocksize=blocksize,
                 callback=self._audio_callback
@@ -190,6 +221,12 @@ class AudioCapture:
             return self._frame_queue.get(timeout=timeout)
         except queue.Empty:
             return None
+
+    def get_pre_roll_audio(self) -> np.ndarray:
+        """获取最近一小段预滚音频（用于句首补偿）"""
+        if not self._pre_roll_frames:
+            return np.array([], dtype=np.float32)
+        return np.concatenate(list(self._pre_roll_frames), axis=0)
 
     def stop(self) -> None:
         """停止音频采集"""

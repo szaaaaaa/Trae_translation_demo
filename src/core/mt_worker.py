@@ -3,6 +3,7 @@ MT (Machine Translation) 工作线程模块
 使用 NLLB 进行文本翻译
 """
 import threading
+import re
 import time
 import logging
 from queue import Queue, Empty
@@ -56,7 +57,9 @@ class MTWorker:
                  tgt_lang: str = "zho_Hans",
                  device: str = "cuda",
                  cache_size: int = 2048,
-                 num_beams: int = 1):
+                 num_beams: int = 1,
+                 max_length: int = 256,
+                 translate_committed_only: bool = True):
         """
         初始化 MT Worker
 
@@ -77,6 +80,8 @@ class MTWorker:
         self.device = device
         self.cache_size = cache_size
         self.num_beams = max(1, int(num_beams))
+        self.max_length = max(32, int(max_length))
+        self.translate_committed_only = translate_committed_only
 
         self._model = None
         self._tokenizer = None
@@ -169,51 +174,62 @@ class MTWorker:
 
         t_start = time.time()
 
-        # 截断过长文本
-        max_chars = 300
-        truncated = text[:max_chars] if len(text) > max_chars else text
+        # 按句子切分，避免长文本截断导致信息丢失
+        max_chars = max(300, self.max_length * 4)
+        sentences = self._split_sentences(text)
+        if sentences:
+            chunks = self._chunk_sentences(sentences, max_chars)
+        else:
+            chunks = [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
 
         try:
             import torch
 
-            # 设置源语言（兼容新旧版 transformers）
-            try:
-                self._tokenizer.src_lang = self.src_lang
-            except AttributeError:
-                pass  # 部分 tokenizer 后端不支持直接设置 src_lang
+            translated_parts = []
 
-            # 编码输入
-            inputs = self._tokenizer(
-                truncated,
-                return_tensors="pt",
-                truncation=True,
-                max_length=256
-            )
+            for chunk in chunks:
+                # 设置源语言（兼容新旧版 transformers）
+                try:
+                    self._tokenizer.src_lang = self.src_lang
+                except AttributeError:
+                    pass  # 部分 tokenizer 后端不支持直接设置 src_lang
 
-            if self.device == "cuda":
-                inputs = {k: v.cuda() for k, v in inputs.items()}
-
-            # 获取目标语言 token ID（兼容新旧版 transformers）
-            if hasattr(self._tokenizer, 'lang_code_to_id'):
-                forced_bos_token_id = self._tokenizer.lang_code_to_id[self.tgt_lang]
-            else:
-                forced_bos_token_id = self._tokenizer.convert_tokens_to_ids(self.tgt_lang)
-
-            # 生成翻译
-            with torch.no_grad():
-                outputs = self._model.generate(
-                    **inputs,
-                    forced_bos_token_id=forced_bos_token_id,
-                    max_length=256,
-                    num_beams=self.num_beams,
-                    do_sample=False
+                # 编码输入
+                inputs = self._tokenizer(
+                    chunk,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=self.max_length
                 )
 
-            # 解码输出
-            translated = self._tokenizer.decode(
-                outputs[0],
-                skip_special_tokens=True
-            )
+                if self.device == "cuda":
+                    inputs = {k: v.cuda() for k, v in inputs.items()}
+
+                # 获取目标语言 token ID（兼容新旧版 transformers）
+                if hasattr(self._tokenizer, 'lang_code_to_id'):
+                    forced_bos_token_id = self._tokenizer.lang_code_to_id[self.tgt_lang]
+                else:
+                    forced_bos_token_id = self._tokenizer.convert_tokens_to_ids(self.tgt_lang)
+
+                # 生成翻译
+                with torch.no_grad():
+                    outputs = self._model.generate(
+                        **inputs,
+                        forced_bos_token_id=forced_bos_token_id,
+                        max_length=self.max_length,
+                        num_beams=self.num_beams,
+                        do_sample=False
+                    )
+
+                # 解码输出
+                translated_parts.append(
+                    self._tokenizer.decode(
+                        outputs[0],
+                        skip_special_tokens=True
+                    ).strip()
+                )
+
+            translated = " ".join([p for p in translated_parts if p])
 
         except Exception as e:
             logger.error(f"翻译错误: {e}")
@@ -233,6 +249,31 @@ class MTWorker:
             t_mt_start=t_start,
             t_mt_end=t_end
         )
+
+    @staticmethod
+    def _split_sentences(text: str) -> list[str]:
+        text = text.strip()
+        if not text:
+            return []
+        parts = re.split(r'(?<=[.!?。！？])\s+', text)
+        return [p.strip() for p in parts if p.strip()]
+
+    @staticmethod
+    def _chunk_sentences(sentences: list[str], max_chars: int) -> list[str]:
+        chunks = []
+        current = ""
+        for sent in sentences:
+            if not current:
+                current = sent
+                continue
+            if len(current) + 1 + len(sent) <= max_chars:
+                current = f"{current} {sent}"
+            else:
+                chunks.append(current)
+                current = sent
+        if current:
+            chunks.append(current)
+        return chunks
 
     def _handle_error(self, error: Exception) -> None:
         """错误处理"""
