@@ -3,11 +3,11 @@ MT (Machine Translation) 工作线程模块
 使用 NLLB 进行文本翻译
 """
 import threading
-import re
 import time
 import logging
 from queue import Queue, Empty
-from typing import Optional
+import re
+from typing import Optional, List
 from collections import OrderedDict
 
 from src.events import MTResult
@@ -58,8 +58,9 @@ class MTWorker:
                  device: str = "cuda",
                  cache_size: int = 2048,
                  num_beams: int = 1,
-                 max_length: int = 256,
-                 translate_committed_only: bool = True):
+                 batch_max_wait_ms: int = 120,
+                 batch_max_chars: int = 220,
+                 max_chars: int = 360):
         """
         初始化 MT Worker
 
@@ -80,8 +81,9 @@ class MTWorker:
         self.device = device
         self.cache_size = cache_size
         self.num_beams = max(1, int(num_beams))
-        self.max_length = max(32, int(max_length))
-        self.translate_committed_only = translate_committed_only
+        self.batch_max_wait_ms = max(20, int(batch_max_wait_ms))
+        self.batch_max_chars = max(50, int(batch_max_chars))
+        self.max_chars = max(120, int(max_chars))
 
         self._model = None
         self._tokenizer = None
@@ -90,6 +92,8 @@ class MTWorker:
         self._thread: Optional[threading.Thread] = None
         self._error_count = 0
         self._max_errors = 3
+        self._pending_parts: List[str] = []
+        self._pending_started_at = 0.0
 
     def load_model(self) -> None:
         """加载翻译模型"""
@@ -139,17 +143,72 @@ class MTWorker:
 
         while self._running:
             try:
-                text = self.input_queue.get(timeout=0.1)
+                text = self.input_queue.get(timeout=0.05)
                 if text and text.strip():
-                    result = self._translate(text)
-                    self.output_queue.put(result)
+                    self._collect_pending(text)
+
+                flushed = self._flush_pending_if_needed(force=False)
+                if flushed is not None:
+                    self.output_queue.put(flushed)
                     self._error_count = 0
             except Empty:
+                flushed = self._flush_pending_if_needed(force=True)
+                if flushed is not None:
+                    self.output_queue.put(flushed)
                 continue
             except Exception as e:
                 self._handle_error(e)
 
         logger.info("MT Worker 已停止")
+
+    def _collect_pending(self, text: str) -> None:
+        """收集短文本，降低每次 generate 的开销并提升上下文完整性。"""
+        normalized = self._normalize_text(text)
+        if not normalized:
+            return
+
+        if not self._pending_parts:
+            self._pending_started_at = time.time()
+
+        self._pending_parts.append(normalized)
+
+    def _flush_pending_if_needed(self, force: bool) -> Optional[MTResult]:
+        """满足条件时合并并翻译。"""
+        if not self._pending_parts:
+            return None
+
+        joined = self._normalize_text(" ".join(self._pending_parts))
+        pending_chars = len(joined)
+        waited_ms = (time.time() - self._pending_started_at) * 1000
+
+        boundary = bool(re.search(r"[.!?。！？]$", joined))
+        should_flush = (
+            pending_chars >= self.batch_max_chars
+            or boundary
+            or (force and waited_ms >= self.batch_max_wait_ms)
+        )
+
+        if not should_flush:
+            return None
+
+        self._pending_parts.clear()
+        self._pending_started_at = 0.0
+        return self._translate(joined)
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
+    def _truncate_on_boundary(text: str, max_chars: int) -> str:
+        if len(text) <= max_chars:
+            return text
+        window = text[:max_chars]
+        markers = ['。', '！', '？', '.', '!', '?', ',', ';', '，', '；']
+        cut = max((window.rfind(m) for m in markers), default=-1)
+        if cut >= int(max_chars * 0.6):
+            return window[:cut + 1]
+        return window
 
     def _translate(self, text: str) -> MTResult:
         """
@@ -161,12 +220,14 @@ class MTWorker:
         Returns:
             MTResult
         """
+        normalized = self._normalize_text(text)
+
         # 检查缓存
-        cached = self._cache.get(text)
+        cached = self._cache.get(normalized)
         if cached is not None:
             logger.debug(f"MT cache hit: '{text[:30]}...'")
             return MTResult(
-                source=text,
+                source=normalized,
                 target=cached,
                 t_mt_start=time.time(),
                 t_mt_end=time.time()
@@ -174,62 +235,49 @@ class MTWorker:
 
         t_start = time.time()
 
-        # 按句子切分，避免长文本截断导致信息丢失
-        max_chars = max(300, self.max_length * 4)
-        sentences = self._split_sentences(text)
-        if sentences:
-            chunks = self._chunk_sentences(sentences, max_chars)
-        else:
-            chunks = [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
+        truncated = self._truncate_on_boundary(normalized, self.max_chars)
 
         try:
             import torch
 
-            translated_parts = []
+            # 设置源语言（兼容新旧版 transformers）
+            try:
+                self._tokenizer.src_lang = self.src_lang
+            except AttributeError:
+                pass  # 部分 tokenizer 后端不支持直接设置 src_lang
 
-            for chunk in chunks:
-                # 设置源语言（兼容新旧版 transformers）
-                try:
-                    self._tokenizer.src_lang = self.src_lang
-                except AttributeError:
-                    pass  # 部分 tokenizer 后端不支持直接设置 src_lang
+            # 编码输入
+            inputs = self._tokenizer(
+                truncated,
+                return_tensors="pt",
+                truncation=True,
+                max_length=256
+            )
 
-                # 编码输入
-                inputs = self._tokenizer(
-                    chunk,
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=self.max_length
+            if self.device == "cuda":
+                inputs = {k: v.cuda() for k, v in inputs.items()}
+
+            # 获取目标语言 token ID（兼容新旧版 transformers）
+            if hasattr(self._tokenizer, 'lang_code_to_id'):
+                forced_bos_token_id = self._tokenizer.lang_code_to_id[self.tgt_lang]
+            else:
+                forced_bos_token_id = self._tokenizer.convert_tokens_to_ids(self.tgt_lang)
+
+            # 生成翻译
+            with torch.inference_mode():
+                outputs = self._model.generate(
+                    **inputs,
+                    forced_bos_token_id=forced_bos_token_id,
+                    max_new_tokens=128,
+                    num_beams=self.num_beams,
+                    do_sample=False
                 )
 
-                if self.device == "cuda":
-                    inputs = {k: v.cuda() for k, v in inputs.items()}
-
-                # 获取目标语言 token ID（兼容新旧版 transformers）
-                if hasattr(self._tokenizer, 'lang_code_to_id'):
-                    forced_bos_token_id = self._tokenizer.lang_code_to_id[self.tgt_lang]
-                else:
-                    forced_bos_token_id = self._tokenizer.convert_tokens_to_ids(self.tgt_lang)
-
-                # 生成翻译
-                with torch.no_grad():
-                    outputs = self._model.generate(
-                        **inputs,
-                        forced_bos_token_id=forced_bos_token_id,
-                        max_length=self.max_length,
-                        num_beams=self.num_beams,
-                        do_sample=False
-                    )
-
-                # 解码输出
-                translated_parts.append(
-                    self._tokenizer.decode(
-                        outputs[0],
-                        skip_special_tokens=True
-                    ).strip()
-                )
-
-            translated = " ".join([p for p in translated_parts if p])
+            # 解码输出
+            translated = self._tokenizer.decode(
+                outputs[0],
+                skip_special_tokens=True
+            )
 
         except Exception as e:
             logger.error(f"翻译错误: {e}")
@@ -239,41 +287,16 @@ class MTWorker:
 
         # 更新缓存
         if translated:
-            self._cache.put(text, translated)
+            self._cache.put(normalized, translated)
 
         logger.debug(f"MT: '{text[:30]}...' -> '{translated[:30]}...' | {(t_end-t_start)*1000:.0f}ms")
 
         return MTResult(
-            source=text,
+            source=normalized,
             target=translated,
             t_mt_start=t_start,
             t_mt_end=t_end
         )
-
-    @staticmethod
-    def _split_sentences(text: str) -> list[str]:
-        text = text.strip()
-        if not text:
-            return []
-        parts = re.split(r'(?<=[.!?。！？])\s+', text)
-        return [p.strip() for p in parts if p.strip()]
-
-    @staticmethod
-    def _chunk_sentences(sentences: list[str], max_chars: int) -> list[str]:
-        chunks = []
-        current = ""
-        for sent in sentences:
-            if not current:
-                current = sent
-                continue
-            if len(current) + 1 + len(sent) <= max_chars:
-                current = f"{current} {sent}"
-            else:
-                chunks.append(current)
-                current = sent
-        if current:
-            chunks.append(current)
-        return chunks
 
     def _handle_error(self, error: Exception) -> None:
         """错误处理"""

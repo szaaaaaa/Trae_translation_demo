@@ -1,58 +1,65 @@
 # 低延迟流式翻译配置
 
-# ===== ASR =====
-asr:
-  engine: faster-whisper
-  model_size: medium
-  compute_type: float16
-  beam_size: 1
-  temperature: 0.0
-  word_timestamps: true
-  condition_on_previous_text: true
-
-# ===== STREAMING WINDOW =====
-streaming:
-  window_ms: 10000
-  step_ms: 400
-  overlap_ms: 2000
-  commit_stable_iterations: 2
-  max_utterance_ms: 30000
-
-# ===== VAD =====
-vad:
-  engine: silero
-  threshold: 0.45
-  speech_end_frames: 40
-  min_speech_frames: 10
-
-# ===== CHUNK / BUFFER =====
+# 音频设置
 audio:
+  input_mode: loopback  # loopback | mic
+  device_index: null    # null 为自动选择
   sample_rate: 16000
-  channels: 1
-  ring_buffer_seconds: 30
-  tail_pad_ms: 1000
-  pre_roll_ms: 400
+  frame_ms: 20
 
-# ===== PARTIAL / FINAL POLICY =====
-stabilizer:
-  enable_partial: true
-  partial_update_interval_ms: 400
-  commit_only_new_text: true
-  use_word_alignment: true
+# VAD 设置
+vad:
+  threshold: 0.50
+  speech_start_frames: 6
+  speech_end_frames: 10
 
-# ===== QUEUES =====
-queues:
-  asr_max_pending: 1
-  mt_max_pending: 2
+# 分块设置
+chunker:
+  chunk_ms: 800
+  overlap_ms: 180
+  max_utterance_ms: 10000
+  tail_pad_ms: 200
 
-# ===== MT (保持现有 NLLB) =====
+# ASR 设置
+asr:
+  model_size: small.en  # tiny | base | small | medium | medium.en | large-v3
+  language: en
+  beam_size: 2
+  temperature: 0.0
+  device: cuda          # cuda | cpu
+  compute_type: float16 # float16 | int8
+
+# MT 设置
 mt:
-  engine: transformers
-  model: facebook/nllb-200-distilled-600M
-  beam_size: 1
-  max_length: 256
-  translate_committed_only: true
+  model_name: facebook/nllb-200-distilled-600M
+  src_lang: eng_Latn
+  tgt_lang: zho_Hans
+  device: cuda
+  cache_size: 4096
+  num_beams: 2
+  batch_max_wait_ms: 120
+  batch_max_chars: 220
+  max_chars: 360
 
-# ===== LOGGING =====
+# 稳定器设置
+stabilizer:
+  lock_min_chars: 12
+  buffer_keep_chars: 80
+  lcp_min_chars: 8
+
+# UI 设置
+ui:
+  refresh_hz: 10
+  history_lines: 50
+  font_size: 24
+  opacity: 0.8
+
+# 队列设置
+queues:
+  max_size: 32
+
+# 日志设置
 logging:
   level: INFO
+  file: logs/app.log
+  latency_file: logs/latency.csv

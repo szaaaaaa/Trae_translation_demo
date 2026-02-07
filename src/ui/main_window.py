@@ -62,9 +62,7 @@ class PipelineWorker(QThread):
                  asr_worker: ASRWorker,
                  text_stabilizer: TextStabilizer,
                  mt_worker: MTWorker,
-                 latency_logger: LatencyLogger,
-                 partial_update_interval_ms: int = 100,
-                 commit_stable_iterations: int = 0):
+                 latency_logger: LatencyLogger):
         super().__init__()
         self.audio_capture = audio_capture
         self.vad = vad
@@ -73,12 +71,6 @@ class PipelineWorker(QThread):
         self.text_stabilizer = text_stabilizer
         self.mt_worker = mt_worker
         self.latency_logger = latency_logger
-        self.partial_update_interval_ms = max(50, int(partial_update_interval_ms))
-        self._last_partial_emit = 0.0
-        self.commit_stable_iterations = max(0, int(commit_stable_iterations))
-        self._stable_partial = ""
-        self._stable_count = 0
-        self._committed_len = 0
         self.is_running = False
 
     def run(self):
@@ -105,8 +97,7 @@ class PipelineWorker(QThread):
                     if vad_event.event_type == "start":
                         self.latency_logger.start_utterance()
                         self.latency_logger.log_capture(frame.timestamp)
-                        pre_audio = self.audio_capture.get_pre_roll_audio()
-                        self.chunker.on_vad_start(vad_event.timestamp, pre_audio=pre_audio)
+                        self.chunker.on_vad_start(vad_event.timestamp)
                         self.status_updated.emit("检测到语音...")
 
                     elif vad_event.event_type == "frame":
@@ -155,9 +146,6 @@ class PipelineWorker(QThread):
                 self.latency_logger.log_stabilize()
 
                 if result.is_final and stable_output.final_append_src:
-                    self._stable_partial = ""
-                    self._stable_count = 0
-                    self._committed_len = 0
                     # 发送到 MT
                     self.latency_logger.log_mt_start()
                     self.mt_worker.input_queue.put(stable_output.final_append_src)
@@ -165,28 +153,7 @@ class PipelineWorker(QThread):
                     self.text_updated.emit("", stable_output.final_append_src, "")
                 else:
                     # 更新 UI（partial）
-                    now = time.time()
-                    if stable_output.partial_src and (
-                        now - self._last_partial_emit >= self.partial_update_interval_ms / 1000.0
-                    ):
-                        self._last_partial_emit = now
-                        self.text_updated.emit(stable_output.partial_src, "", "")
-
-                    if self.commit_stable_iterations > 0 and stable_output.partial_src:
-                        if stable_output.partial_src == self._stable_partial:
-                            self._stable_count += 1
-                        else:
-                            self._stable_partial = stable_output.partial_src
-                            self._stable_count = 1
-
-                        if self._stable_count >= self.commit_stable_iterations:
-                            if len(stable_output.partial_src) > self._committed_len:
-                                delta = stable_output.partial_src[self._committed_len:].strip()
-                                if delta:
-                                    self.latency_logger.log_mt_start()
-                                    self.mt_worker.input_queue.put(delta)
-                                    self.text_updated.emit("", delta, "")
-                                    self._committed_len = len(stable_output.partial_src)
+                    self.text_updated.emit(stable_output.partial_src, "", "")
         except Exception as e:
             logger.error(f"处理 ASR 结果错误: {e}")
 
@@ -218,8 +185,7 @@ class MainWindow(QMainWindow):
         self.resize(450, 650)
 
         self.cm = ConfigManager()
-        self._config = config or {}
-        self._init_components(self._config)
+        self._init_components(config or {})
         self._init_ui()
 
         self.subtitle_window = SubtitleWindow(self.cm.config.get("display", {}))
@@ -236,45 +202,39 @@ class MainWindow(QMainWindow):
         # 从配置获取参数
         audio_cfg = self.cm.get("audio")
         vad_cfg = config.get("vad", {})
-        streaming_cfg = config.get("streaming", {})
+        chunker_cfg = config.get("chunker", {})
         asr_cfg = config.get("asr", {})
         mt_cfg = config.get("mt", {})
         stabilizer_cfg = config.get("stabilizer", {})
-        queues_cfg = config.get("queues", {})
 
         # 音频采集
         self.audio_capture = AudioCapture(
             mode=audio_cfg.get("input_mode", "loopback"),
             device_index=audio_cfg.get("device_index"),
-            sample_rate=config.get("audio", {}).get("sample_rate", 16000),
-            frame_ms=20,
-            channels=config.get("audio", {}).get("channels", 1),
-            ring_buffer_seconds=config.get("audio", {}).get("ring_buffer_seconds", 20),
-            pre_roll_ms=config.get("audio", {}).get("pre_roll_ms", 400)
+            sample_rate=16000,
+            frame_ms=20
         )
 
         # VAD
         self.vad = SileroVAD(
             threshold=vad_cfg.get("threshold", 0.5),
-            speech_start_frames=vad_cfg.get("min_speech_frames", vad_cfg.get("speech_start_frames", 6)),
+            speech_start_frames=vad_cfg.get("speech_start_frames", 6),
             speech_end_frames=vad_cfg.get("speech_end_frames", 10)
         )
 
         # Chunker
         self.chunker = Chunker(
-            chunk_ms=streaming_cfg.get("step_ms", streaming_cfg.get("window_ms", 1000)),
-            overlap_ms=streaming_cfg.get("overlap_ms", 200),
-            max_utterance_ms=streaming_cfg.get("max_utterance_ms", 10000),
-            tail_pad_ms=config.get("audio", {}).get("tail_pad_ms", 120),
-            window_ms=streaming_cfg.get("window_ms", 0),
-            step_ms=streaming_cfg.get("step_ms", 0)
+            chunk_ms=chunker_cfg.get("chunk_ms", 1000),
+            overlap_ms=chunker_cfg.get("overlap_ms", 200),
+            max_utterance_ms=chunker_cfg.get("max_utterance_ms", 10000),
+            tail_pad_ms=chunker_cfg.get("tail_pad_ms", 120)
         )
 
         # 队列
-        self.q_asr_in = Queue(maxsize=queues_cfg.get("asr_max_pending", 32))
-        self.q_asr_out = Queue(maxsize=queues_cfg.get("asr_max_pending", 32))
-        self.q_mt_in = Queue(maxsize=queues_cfg.get("mt_max_pending", 32))
-        self.q_mt_out = Queue(maxsize=queues_cfg.get("mt_max_pending", 32))
+        self.q_asr_in = Queue(maxsize=32)
+        self.q_asr_out = Queue(maxsize=32)
+        self.q_mt_in = Queue(maxsize=32)
+        self.q_mt_out = Queue(maxsize=32)
 
         # ASR Worker
         self.asr_worker = ASRWorker(
@@ -285,32 +245,29 @@ class MainWindow(QMainWindow):
             device=asr_cfg.get("device", "cuda"),
             compute_type=asr_cfg.get("compute_type", "float16"),
             beam_size=asr_cfg.get("beam_size", 1),
-            temperature=asr_cfg.get("temperature", 0.0),
-            word_timestamps=asr_cfg.get("word_timestamps", False),
-            condition_on_previous_text=asr_cfg.get("condition_on_previous_text", False)
+            temperature=asr_cfg.get("temperature", 0.0)
         )
 
         # Text Stabilizer
         self.text_stabilizer = TextStabilizer(
             lock_min_chars=stabilizer_cfg.get("lock_min_chars", 12),
             buffer_keep_chars=stabilizer_cfg.get("buffer_keep_chars", 80),
-            lcp_min_chars=stabilizer_cfg.get("lcp_min_chars", 8),
-            enable_partial=stabilizer_cfg.get("enable_partial", True),
-            commit_only_new_text=stabilizer_cfg.get("commit_only_new_text", True),
-            use_word_alignment=stabilizer_cfg.get("use_word_alignment", False)
+            lcp_min_chars=stabilizer_cfg.get("lcp_min_chars", 8)
         )
 
         # MT Worker
         self.mt_worker = MTWorker(
             input_queue=self.q_mt_in,
             output_queue=self.q_mt_out,
-            model_name=mt_cfg.get("model", mt_cfg.get("model_name", "facebook/nllb-200-distilled-600M")),
+            model_name=mt_cfg.get("model_name", "facebook/nllb-200-distilled-600M"),
             src_lang=mt_cfg.get("src_lang", "eng_Latn"),
             tgt_lang=mt_cfg.get("tgt_lang", "zho_Hans"),
             device=mt_cfg.get("device", "cuda"),
-            num_beams=mt_cfg.get("beam_size", mt_cfg.get("num_beams", 1)),
-            max_length=mt_cfg.get("max_length", 256),
-            translate_committed_only=mt_cfg.get("translate_committed_only", True)
+            cache_size=mt_cfg.get("cache_size", 4096),
+            num_beams=mt_cfg.get("num_beams", 2),
+            batch_max_wait_ms=mt_cfg.get("batch_max_wait_ms", 120),
+            batch_max_chars=mt_cfg.get("batch_max_chars", 220),
+            max_chars=mt_cfg.get("max_chars", 360)
         )
 
         # Latency Logger
@@ -437,80 +394,15 @@ class MainWindow(QMainWindow):
         """刷新音频设备列表"""
         self.combo_devices.clear()
         devices = self.audio_capture.list_devices()
-        defaults = self.audio_capture.get_default_devices()
+
         default_index = self.cm.get("audio").get("device_index")
-
-        wasapi_devs = [d for d in devices if "WASAPI" in d.get("hostapi", "")]
-
-        def name_lower(dev: dict) -> str:
-            return dev["name"].lower()
-
-        def is_vb_cable(dev: dict) -> bool:
-            name = name_lower(dev)
-            return "cable output" in name and "vb-audio" in name
-
-        def is_mic_array(dev: dict) -> bool:
-            name = name_lower(dev)
-            return "microphone array" in name or "麦克风阵列" in name or "阵列" in name
-
-        def is_microphone(dev: dict) -> bool:
-            name = name_lower(dev)
-            return any(k in name for k in ["microphone", "mic", "麦克风"])
-
-        def is_headset_hint(dev: dict) -> bool:
-            name = name_lower(dev)
-            return any(k in name for k in ["headset", "耳机", "耳麦"])
-
-        def pick_first(predicate):
-            for d in wasapi_devs:
-                if predicate(d):
-                    return d
-            return None
-
-        def pick_prefer_realtek(candidates):
-            if not candidates:
-                return None
-            for d in candidates:
-                if "realtek" in name_lower(d):
-                    return d
-            return candidates[0]
-
-        vb_dev = pick_first(is_vb_cable)
-
-        mic_arrays = [d for d in wasapi_devs if is_mic_array(d)]
-        array_dev = pick_prefer_realtek(mic_arrays)
-
-        # Headset mic: any WASAPI mic that is not array; prefer headset keywords, then Realtek
-        mic_devs = [d for d in wasapi_devs if is_microphone(d) and not is_mic_array(d)]
-        headset_candidates = [d for d in mic_devs if is_headset_hint(d)]
-        headset_dev = pick_prefer_realtek(headset_candidates) or pick_prefer_realtek(mic_devs)
-
-        items = [
-            ("电脑声音（会议/视频）", vb_dev),
-            ("耳机麦克风", headset_dev),
-            ("电脑麦克风", array_dev),
-        ]
-
-        for label, dev in items:
-            if dev is None:
-                self.combo_devices.addItem(f"{label}（未检测到）", None)
-            else:
-                self.combo_devices.addItem(label, dev["index"])
-
-        # Restore selection if possible
         current_idx = 0
-        if default_index is not None:
-            for i in range(self.combo_devices.count()):
-                if self.combo_devices.itemData(i) == default_index:
-                    current_idx = i
-                    break
-        else:
-            default_in = defaults.get("input")
-            if default_in is not None:
-                for i, (_, dev) in enumerate(items):
-                    if dev and dev["index"] == default_in:
-                        current_idx = i
-                        break
+
+        for i, dev in enumerate(devices):
+            name = f"[{dev['index']}] {dev['name']} ({dev['hostapi']})"
+            self.combo_devices.addItem(name, dev['index'])
+            if default_index is not None and dev['index'] == default_index:
+                current_idx = i
 
         self.combo_devices.setCurrentIndex(current_idx)
 
@@ -551,9 +443,7 @@ class MainWindow(QMainWindow):
                 self.asr_worker,
                 self.text_stabilizer,
                 self.mt_worker,
-                self.latency_logger,
-                partial_update_interval_ms=self._config.get("stabilizer", {}).get("partial_update_interval_ms", 100),
-                commit_stable_iterations=self._config.get("streaming", {}).get("commit_stable_iterations", 0)
+                self.latency_logger
             )
             self.worker.text_updated.connect(self.subtitle_window.update_subtitle)
             self.worker.status_updated.connect(self.log)
